@@ -1,0 +1,389 @@
+# ====================================================================
+# ESPHome Oven PID Controller & Autotuner
+#
+# Date: June 11, 2025
+#
+# Description: This configuration creates a complete oven controller.
+# It has two main functions:
+#   1. PID Autotuner: A one-time process to calculate the optimal
+#      PID (Kp, Ki, Kd) constants for your specific oven.
+#   2. PID Controller: A climate entity that uses the tuned constants
+#      to precisely manage the oven's temperature to a setpoint.
+#
+# WORKFLOW:
+# ---------
+# 1. (First-Time Setup) In Home Assistant, turn ON the
+#    "Start PID Auto-Tune" switch. Let the process run to completion.
+#    The script will automatically calculate, save, and apply the
+#    optimal PID values.
+#
+# 2. (Normal Cooking Use) In Home Assistant, find the
+#    "Oven PID Controller" entity and set your desired temperature.
+#
+# 3. Press the physical "Start Button" for 2 seconds to activate the
+#    controller and begin heating.
+#
+# 4. Press the "Cancel Button" for 2 seconds at any time to immediately
+#    stop all heating processes.
+#
+# GPIO USAGE SUMMARY:
+# -------------------
+# GPIO2:  Output - Wi-Fi Status LED.
+# GPIO14: Input  - "Start Process Button" (Activates PID Controller)
+# GPIO18: Output - SPI Clock (SCLK) for the MAX6675 thermocouple amplifier.
+# GPIO19: Input  - SPI Data (MISO) from the MAX6675.
+# GPIO23: Output - SPI Chip Select (CS) for the MAX6675.
+# GPIO26: Output - Controls the relay or Solid State Relay (SSR) for the heater.
+# GPIO27: Input  - "Cancel/Stop Button"
+# ====================================================================
+
+esphome:
+  name: oven-controller-1
+  friendly_name: OVEN-CONTROLLER-1
+  on_boot:
+    priority: -100
+    then:
+      - lambda: |-
+          ESP_LOGI("main", "Setting PID parameters from saved globals on boot.");
+          // FIX: This is the correct C++ API to set PID parameters.
+          // Use the public setter methods directly on the component ID.
+          id(oven_pid_controller).set_kp(id(pid_kp));
+          id(oven_pid_controller).set_ki(id(pid_ki));
+          id(oven_pid_controller).set_kd(id(pid_kd));
+
+esp32:
+  board: esp32dev
+  framework:
+    type: arduino
+    version: recommended
+
+logger:
+  level: DEBUG
+
+api:
+  encryption:
+    key: "cx2SCavjOIVpOHAK4oVI6LmHm2a3VbRpdGVbYVavVT0="
+
+ota:
+  platform: esphome
+  password: "8ae36d178a96f2baa09949a30d06bd3b"
+
+spi:
+  clk_pin: GPIO18
+  miso_pin: GPIO19
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  power_save_mode: none
+  output_power: 17dB
+  manual_ip:
+    static_ip: 10.100.50.47
+    gateway: 10.100.50.1
+    subnet: 255.255.255.0
+    dns1: 8.8.8.8
+    dns2: 8.8.4.4
+  on_connect:
+    then:
+    - output.turn_on: wifi_led_output
+    - lambda: |-
+        auto ip = WiFi.localIP().toString();
+        ESP_LOGI("wifi", "WiFi Connected. IP: %s", ip.c_str());
+  on_disconnect:
+    then:
+    - output.turn_off: wifi_led_output
+    - lambda: |-
+        ESP_LOGI("wifi", "WiFi disconnected. Attempting reconnect...");
+    - wait_until:
+        condition:
+          wifi.connected: {}
+        timeout: 30s
+    - if:
+        condition:
+          not:
+            wifi.connected: {}
+        then:
+        - lambda: |-
+            ESP_LOGW("wifi", "Still down after 30s — restarting ESP32!");
+            ESP.restart();
+  ap:
+    ssid: "Oven1Fallback"
+    password: "KFCK-VaK-ASDJfbb3FKF"
+
+globals:
+  - id: pid_kp
+    type: float
+    restore_value: yes
+    initial_value: '25.0'
+  - id: pid_ki
+    type: float
+    restore_value: yes
+    initial_value: '0.1'
+  - id: pid_kd
+    type: float
+    restore_value: yes
+    initial_value: '100.0'
+  - id: autotune_active
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+  - id: temp_max
+    type: float
+    initial_value: '0.0'
+  - id: temp_min
+    type: float
+    initial_value: '1000.0'
+  - id: last_peak_time
+    type: int
+    initial_value: '0'
+  - id: oscillation_period
+    type: int
+    initial_value: '0'
+  - id: oscillation_count
+    type: int
+    initial_value: '0'
+
+output:
+  - platform: gpio
+    pin: GPIO2
+    id: wifi_led_output
+  - platform: slow_pwm
+    pin: GPIO26
+    id: heater_output
+    period: 5s
+
+climate:
+  - platform: pid
+    id: oven_pid_controller
+    name: "Oven PID Controller"
+    sensor: oven_temp
+    heat_output: heater_output
+    default_target_temperature: 150.0
+    control_parameters:
+      kp: 25.0
+      ki: 0.1
+      kd: 100.0
+
+switch:
+- platform: template
+  name: "Start PID Auto-Tune"
+  id: autotune_switch
+  icon: "mdi:tune"
+  lambda: |-
+    return id(autotune_active);
+  turn_on_action:
+  - lambda: |-
+      if (!id(autotune_active)) {
+        id(autotune_active) = true;
+        ESP_LOGI("autotune", "Starting auto-tune...");
+        id(temp_max) = 0.0;
+        id(temp_min) = 1000.0;
+        id(last_peak_time) = 0;
+        id(oscillation_period) = 0;
+        id(oscillation_count) = 0;
+      }
+  - script.execute: pid_autotune_routine
+  turn_off_action:
+  - lambda: |-
+      id(autotune_active) = false;
+      ESP_LOGI("autotune", "Auto-tune manually stopped.");
+  - script.execute: cancel_heating_and_autotune
+
+sensor:
+  - platform: max6675
+    name: "Oven Temperature"
+    id: oven_temp
+    cs_pin: GPIO23
+    update_interval: 5s
+    on_value:
+      then:
+        - if:
+            condition:
+              lambda: 'return id(oven_temp).state >= 500.0;'
+            then:
+              - logger.log:
+                  format: "EMERGENCY: Max temp 500°C reached! Aborting all processes."
+              - script.execute: cancel_heating_and_autotune
+        - if:
+            condition:
+              lambda: 'return id(autotune_active);'
+            then:
+              - lambda: |-
+                  float t = id(oven_temp).state;
+                  if (t > id(temp_max)) id(temp_max) = t;
+                  if (t < id(temp_min)) id(temp_min) = t;
+                  int now = millis() / 1000;
+                  static bool was_rising = false;
+                  static float last_temp_for_peak = 0;
+                  bool rising = (t > last_temp_for_peak);
+                  if (!rising && was_rising && last_temp_for_peak > 0) {
+                    if (id(last_peak_time) != 0) {
+                      int Tu = now - id(last_peak_time);
+                      if (Tu > 0) {
+                        id(oscillation_period) = Tu;
+                        id(oscillation_count)++;
+                        ESP_LOGI("autotune", "Oscillation #%d detected: Tu = %d sec (%.1f°C)", id(oscillation_count), Tu, t);
+                        if (id(oscillation_count) >= 3) {
+                          ESP_LOGI("autotune", "Sufficient oscillations detected. Finalizing autotune.");
+                          id(calculate_final_pid_values).execute();
+                        }
+                      }
+                    }
+                    id(last_peak_time) = now;
+                  }
+                  was_rising = rising;
+                  last_temp_for_peak = t;
+        - if:
+            condition:
+              lambda: 'return id(autotune_active) && id(oven_temp).state > 350.0;'
+            then:
+              - logger.log:
+                  format: "SAFETY: Over-temperature during auto-tune! Turning off heater!"
+              - script.execute: cancel_heating_and_autotune
+  - platform: uptime
+    name: "Uptime Sensor"
+
+text_sensor:
+- platform: template
+  name: "Computed PID Parameters"
+  icon: "mdi:calculator"
+  lambda: |-
+    float a = (id(temp_max) - id(temp_min)) / 2.0;
+    float Ku = (4.0 * 1.0) / (M_PI * a);
+    float Tu = id(oscillation_period);
+    if (Tu < 1 || a < 0.5) {
+      return std::string("Awaiting valid autotune data...");
+    }
+    float Kp = 0.6 * Ku;
+    float Ki = (2.0 * Kp) / Tu;
+    float Kd = (Kp * Tu) / 8.0;
+    char buffer[64];
+    snprintf(buffer, sizeof(buffer), "Kp=%.3f Ki=%.3f Kd=%.3f", Kp, Ki, Kd);
+    return std::string(buffer);
+  update_interval: 10s
+
+script:
+- id: cancel_heating_and_autotune
+  then:
+  - logger.log:
+      format: "Canceling all heating operations and autotune..."
+  - climate.control:
+      id: oven_pid_controller
+      mode: "OFF"
+  - lambda: 'id(autotune_active) = false;'
+  - script.stop: pid_autotune_routine
+  - script.stop: calculate_final_pid_values
+
+- id: calculate_final_pid_values
+  then:
+  - lambda: |-
+      if (!id(autotune_active) || id(oscillation_period) < 1 || (id(temp_max) - id(temp_min)) < 0.5) {
+        ESP_LOGW("autotune", "Autotune aborted or invalid data. Not calculating PID.");
+        auto off_call = id(oven_pid_controller).make_call();
+        off_call.set_mode(climate::CLIMATE_MODE_OFF);
+        off_call.perform();
+        id(autotune_active) = false;
+        return;
+      }
+      float a = (id(temp_max) - id(temp_min)) / 2.0;
+      float Ku = (4.0 * 1.0) / (M_PI * a);
+      float Tu = id(oscillation_period);
+      float Kp = 0.6 * Ku;
+      float Ki = (2.0 * Kp) / Tu;
+      float Kd = (Kp * Tu) / 8.0;
+
+      id(pid_kp) = Kp;
+      id(pid_ki) = Ki;
+      id(pid_kd) = Kd;
+
+      // FIX: This is the correct C++ API to set PID parameters.
+      id(oven_pid_controller).set_kp(Kp);
+      id(oven_pid_controller).set_ki(Ki);
+      id(oven_pid_controller).set_kd(Kd);
+
+      ESP_LOGI("autotune", "--- PID Autotune Complete ---");
+      ESP_LOGI("autotune", "New PID parameters have been calculated, saved, and applied.");
+      ESP_LOGI("autotune", "  Kp = %.3f", Kp);
+      ESP_LOGI("autotune", "  Ki = %.3f", Ki);
+      ESP_LOGI("autotune", "  Kd = %.3f", Kd);
+      
+      auto off_call = id(oven_pid_controller).make_call();
+      off_call.set_mode(climate::CLIMATE_MODE_OFF);
+      off_call.perform();
+      id(autotune_active) = false;
+
+- id: pid_autotune_routine
+  mode: restart
+  then:
+  - climate.control:
+      id: oven_pid_controller
+      mode: "OFF"
+  - logger.log: "Autotune: Waiting for initial stabilization (10s)..."
+  - delay: 10s
+  - logger.log: "Autotune: Starting oscillation cycles..."
+  - repeat:
+      count: 6
+      then:
+      - if:
+          condition:
+            not:
+              lambda: 'return id(autotune_active);'
+          then:
+          - logger.log: "Auto-tune canceled mid-cycle by external command."
+          - script.stop: pid_autotune_routine
+      - logger.log: "Auto-tune cycle: Heater ON"
+      - output.turn_on: heater_output
+      - delay: 30s
+      - logger.log: "Auto-tune cycle: Heater OFF"
+      - output.turn_off: heater_output
+      - delay: 60s
+  - logger.log: "Autotune: Completed oscillation cycles. Waiting for final peak detection."
+  - output.turn_off: heater_output
+  - delay: 60s
+  - if:
+      condition:
+        lambda: 'return id(autotune_active);'
+      then:
+      - logger.log: "Autotune: All cycles complete, forcing final calculation."
+      - script.execute: calculate_final_pid_values
+
+binary_sensor:
+- platform: status
+  name: "Connection Status"
+  id: connection_status
+  entity_category: diagnostic
+
+- platform: gpio
+  pin:
+    number: GPIO27
+    mode: INPUT_PULLUP
+    inverted: true
+  name: "Cancel Button"
+  id: cancel_button
+  on_multi_click:
+  - timing:
+    - ON for at least 2s
+    then:
+    - logger.log: "ACTION: Cancel button held. Stopping all processes."
+    - script.execute: cancel_heating_and_autotune
+
+- platform: gpio
+  pin:
+    number: GPIO14
+    mode: INPUT_PULLUP
+    inverted: true
+  name: "Start Button"
+  id: start_button
+  on_multi_click:
+  - timing:
+    - ON for at least 2s
+    then:
+    - lambda: |-
+        if (id(oven_pid_controller).mode == CLIMATE_MODE_OFF && !id(autotune_active)) {
+          ESP_LOGI("start", "ACTION: Start button held. Activating PID controller to HEAT.");
+          auto call = id(oven_pid_controller).make_call();
+          call.set_mode(climate::CLIMATE_MODE_HEAT);
+          call.perform();
+        } else {
+          ESP_LOGI("start", "ACTION: Start button held, but controller is already active or autotune is running.");
+        }
